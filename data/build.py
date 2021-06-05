@@ -82,6 +82,15 @@ def build_dataset(is_train, config):
             root = os.path.join(config.DATA.DATA_PATH, prefix)
             dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = 1000
+    if config.DATA.DATASET == 'cifar':
+        prefix = 'True' if is_train else 'False'
+        dataset = datasets.CIFAR10(
+        root= '../',
+        train=prefix,
+        download=False,
+        transform=transform
+        )
+        nb_classes = 10
     else:
         raise NotImplementedError("We only support ImageNet Now.")
 

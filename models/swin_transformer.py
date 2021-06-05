@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-
+import torch.nn.functional as F
 
 class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
@@ -455,6 +455,97 @@ class PatchEmbed(nn.Module):
         return flops
 
 
+### MLP block
+class Residual(nn.Module):
+    def __init__(self, fn):
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x):
+        return self.fn(x) + x
+
+
+class PreNorm(nn.Module):
+    def __init__(self, dim, fn):
+        super().__init__()
+        self.fn = fn
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x, **kwargs):
+        x = self.norm(x)
+        return self.fn(x, **kwargs)
+
+
+def exists(val):
+    return val is not None
+
+
+class SpatialGatingUnit(nn.Module):
+    def __init__(self, dim, dim_seq, causal = False, act = nn.Identity(), init_eps = 1e-3):
+        super().__init__()
+        dim_out = dim // 2
+        self.causal = causal
+
+        self.norm = nn.LayerNorm(dim_out)
+        self.proj = nn.Conv1d(dim_seq, dim_seq, 1)
+
+        self.act = act
+
+        init_eps /= dim_seq
+        nn.init.uniform_(self.proj.weight, -init_eps, init_eps)
+        nn.init.constant_(self.proj.bias, 1.)
+
+    def forward(self, x, gate_res = None):
+        device, n = x.device, x.shape[1]
+
+        res, gate = x.chunk(2, dim = -1)
+        gate = self.norm(gate)
+
+        weight, bias = self.proj.weight, self.proj.bias
+        if self.causal:
+            weight, bias = weight[:n, :n], bias[:n]
+            mask = torch.ones(weight.shape[:2], device = device).triu_(1).bool()
+            weight = weight.masked_fill(mask[..., None], 0.)
+
+        gate = F.conv1d(gate, weight, bias)
+
+        if exists(gate_res):
+            gate = gate + gate_res
+
+        return self.act(gate) * res
+
+
+class gMLPBlock(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        dim_ff,
+        seq_len,
+        attn_dim = None,
+        causal = False,
+        act = nn.Identity()
+    ):
+        super().__init__()
+        self.proj_in = nn.Sequential(
+            nn.Linear(dim, dim_ff),
+            nn.GELU()
+        )
+
+        self.attn = Attention(dim, dim_ff // 2, attn_dim, causal) if exists(attn_dim) else None
+
+        self.sgu = SpatialGatingUnit(dim_ff, seq_len, causal, act)
+        self.proj_out = nn.Linear(dim_ff // 2, dim)
+
+    def forward(self, x):
+        gate_res = self.attn(x) if exists(self.attn) else None
+
+        x = self.proj_in(x)
+        x = self.sgu(x, gate_res = gate_res)
+        x = self.proj_out(x)
+        return x
+
+
 class SwinTransformer(nn.Module):
     r""" Swin Transformer
         A PyTorch impl of : `Swin Transformer: Hierarchical Vision Transformer using Shifted Windows`  -
@@ -518,19 +609,33 @@ class SwinTransformer(nn.Module):
         # build layers
         self.layers = nn.ModuleList()
         for i_layer in range(self.num_layers):
-            layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
-                               input_resolution=(patches_resolution[0] // (2 ** i_layer),
-                                                 patches_resolution[1] // (2 ** i_layer)),
-                               depth=depths[i_layer],
-                               num_heads=num_heads[i_layer],
-                               window_size=window_size,
-                               mlp_ratio=self.mlp_ratio,
-                               qkv_bias=qkv_bias, qk_scale=qk_scale,
-                               drop=drop_rate, attn_drop=attn_drop_rate,
-                               drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
-                               norm_layer=norm_layer,
-                               downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
-                               use_checkpoint=use_checkpoint)
+
+            # Last stage use MLP
+            if i_layer == 3:
+                dim = int(embed_dim * 2 ** i_layer)
+                ff_mult = 4
+                dim_ff = dim * ff_mult
+                num_patches = (patches_resolution[0] // (2 ** i_layer)) * (patches_resolution[1] // (2 ** i_layer))
+                # add a tiny amount of attention or not
+                attn_dim = None
+                layer =  Residual(PreNorm(dim, gMLPBlock(dim = dim, dim_ff = dim_ff, seq_len = num_patches, attn_dim = attn_dim))) 
+
+            # First three stages    
+            else: 
+                layer = BasicLayer(dim=int(embed_dim * 2 ** i_layer),
+                                input_resolution=(patches_resolution[0] // (2 ** i_layer),
+                                                    patches_resolution[1] // (2 ** i_layer)),
+                                depth=depths[i_layer],
+                                num_heads=num_heads[i_layer],
+                                window_size=window_size,
+                                mlp_ratio=self.mlp_ratio,
+                                qkv_bias=qkv_bias, qk_scale=qk_scale,
+                                drop=drop_rate, attn_drop=attn_drop_rate,
+                                drop_path=dpr[sum(depths[:i_layer]):sum(depths[:i_layer + 1])],
+                                norm_layer=norm_layer,
+                                downsample=PatchMerging if (i_layer < self.num_layers - 1) else None,
+                                use_checkpoint=use_checkpoint)
+
             self.layers.append(layer)
 
         self.norm = norm_layer(self.num_features)
